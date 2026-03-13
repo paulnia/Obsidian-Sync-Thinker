@@ -1,0 +1,9 @@
+langgraph
+langchain
+langchain-community
+langchain-openai
+langchain-ollama
+chromadb==1.5.5
+watchdog==6.0.0
+pyyaml==6.0.3
+pydantic==2.12.5

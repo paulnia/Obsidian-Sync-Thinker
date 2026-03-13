@@ -6,6 +6,8 @@
 .chroma_db/
 logs/
 test_vault/
+.ost_cache
+.ost_cache.*
 
 # 2. 配置文件 (防止泄露本地路径或未来的 API Key)
 config/settings.yaml

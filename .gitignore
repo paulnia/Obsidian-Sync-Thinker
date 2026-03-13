@@ -1,6 +1,39 @@
-# gitignore template for LangChain products, e.g., LangGraph, LangSmith
-# website: https://www.langchain.com/
-# website: https://www.langchain.com/langgraph
+# ========================
+# Obsidian-Sync-Thinker (OST)
+# ========================
 
-# LangGraph
-.langgraph_api/
+# 1. 项目专属数据与日志 (极其重要)
+.chroma_db/
+logs/
+test_vault/
+
+# 2. 配置文件 (防止泄露本地路径或未来的 API Key)
+config/settings.yaml
+
+# 3. Python 基础缓存与编译文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 4. 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+*.conda/
+.conda/
+
+# 5. 环境变量与机密
+.env
+.env.*
+!.env.example
+
+# 6. 编辑器与系统文件
+.vscode/
+.idea/
+.cursor/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

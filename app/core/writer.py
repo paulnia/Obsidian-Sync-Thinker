@@ -70,9 +70,13 @@ class InsightsWriter:
 
     def _render_callout_block(self, links: list[dict[str, Any]]) -> str:
         """
-        把 links 渲染为 Obsidian Callout 块：
+        把 links 渲染为 Obsidian Callout + Todo 列表：
         > [!AI-Insights]
-        > - ...
+        > - [ ] [AI 建议] [[file#header]] - 理由: ...
+
+        约定：
+        - 初次写入时一律为未勾选 `[ ]`，表示“待人工确认”
+        - 若用户在 Obsidian 中改为 `[x]`，即视为已采纳；若删除该行，则视为拒绝
         """
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -96,8 +100,15 @@ class InsightsWriter:
                 tgt_file = str(tgt.get("file") or "")
                 tgt_header = str(tgt.get("header") or "")
 
-                # 用 markdown 列表表达链接结果；header 用引用符号增强可读性
-                item = f"> - **{rel}** → `{tgt_file}` 〔{tgt_header}〕"
+                # 以 Todo 列表形式呈现 AI 建议，使用 Obsidian 支持的 task 语法
+                # 例如：- [ ] [AI 建议] [[Dijkstra算法#复杂度分析]] - 理由: ...
+                if tgt_file or tgt_header:
+                    link_label = f"{tgt_file}#{tgt_header}" if tgt_header else tgt_file
+                    display = f"[[{link_label}]]"
+                else:
+                    display = "(未知目标)"
+
+                item = f"> - [ ] [AI 建议] {display} - **{rel}**"
                 lines.append(item)
                 if rationale:
                     lines.append(f">   - 理由: {rationale}")

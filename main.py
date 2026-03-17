@@ -25,6 +25,7 @@ from app.core.writer import InsightsWriter
 from app.database.cache_manager import CacheManager
 from app.database.vector_store import VectorStoreManager
 from app.utils.md_handler import MarkdownHandler
+from app.utils.observability import setup_langsmith
 from app.service.watcher import ObsidianWatcher
 
 logger = logging.getLogger(__name__)
@@ -70,15 +71,41 @@ async def worker_loop(queue: asyncio.Queue[str]) -> None:
                 cache_manager.update_cache(filepath, current_md5)
                 continue
 
-            # 3) 向量库 upsert 当前文件 chunks（即使后续推理失败，也尽量保持向量库逐步完善）
+            # 3) 清空该文件在向量库中的历史版本，然后 upsert 当前文件 chunks
+            #    这样可以保证向量库中只保留“当前版本”的内容，避免旧版本长期堆积。
+            vector_store.clear_file(filepath)
             vector_store.add_chunks(chunks)
 
-            # 4) 对每个 chunk 检索 candidates，跑 LangGraph 状态机，收集 links
+            # 4) 对每个 chunk 检索 candidates（排除当前文件，优先同目录），跑 LangGraph 状态机，收集 links
             final_links: list[dict] = []
 
             for idx, chunk in enumerate(chunks):
                 query_text = str(chunk.get("content") or "").strip()
-                candidates = vector_store.search_similar(query_text, top_k=5) if query_text else []
+                candidates = (
+                    vector_store.search_similar(
+                        query_text,
+                        top_k=5,
+                        exclude_file=filepath,
+                        prefer_same_dir=True,
+                    )
+                    if query_text
+                    else []
+                )
+
+                # 保险起见，再在调用侧过滤一次“当前文件”的候选，防止路径大小写/分隔符差异导致漏网
+                if candidates:
+                    cur_file_norm = str(filepath).replace("\\", "/").lower()
+                    filtered: list[dict] = []
+                    for c in candidates:
+                        md = c.get("metadata") or {}
+                        if not isinstance(md, dict):
+                            filtered.append(c)
+                            continue
+                        f = str(md.get("file") or "").replace("\\", "/").lower()
+                        if f == cur_file_norm:
+                            continue
+                        filtered.append(c)
+                    candidates = filtered
 
                 # KnowledgeState 初始化（只放必要字段）
                 init_state: KnowledgeState = {
@@ -123,6 +150,11 @@ async def main() -> None:
     # 读取配置：找不到配置文件会抛出明确异常（按需求）
     cfg = get_config().data
     vault_dir = get_config().vault_dir
+
+    # 在使用任何 LLM 之前初始化 LangSmith 观测（基于环境变量）
+    # - 若本机设置了 LANGSMITH_API_KEY 或 LANGCHAIN_API_KEY，则会自动开启 Tracing v2
+    # - 未设置时不会有任何副作用
+    setup_langsmith(project_name="Obsidian-Sync-Thinker")
     logger.info("OST 启动，vault=%s db=%s debounce=%ss max_retries=%s provider=%s",
                 vault_dir.as_posix(), cfg.db_path, cfg.debounce_timeout, cfg.max_retries, cfg.llm.provider)
 

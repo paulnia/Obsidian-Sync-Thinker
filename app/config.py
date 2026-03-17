@@ -40,6 +40,9 @@ class ConfigData:
     debounce_timeout: int
     max_retries: int
     llm: LLMConfig
+    # 可选：用于“混合架构”（本地 + 云端）的推理模型配置
+    # - 未配置时默认与 llm 相同
+    llm_reasoning: LLMConfig | None = None
 
 
 class Config:
@@ -121,15 +124,37 @@ class Config:
         debounce_timeout = int(loaded.get("debounce_timeout") or 10)
         max_retries = int(loaded.get("max_retries") or 3)
 
-        llm_raw = loaded.get("llm") or {}
-        if not isinstance(llm_raw, dict):
-            raise ValueError("配置错误：llm 必须是一个字典。示例见 `config/settings.yaml`。")
+        def _parse_llm(key: str) -> LLMConfig | None:
+            raw = loaded.get(key)
+            if raw is None:
+                return None
+            if not isinstance(raw, dict):
+                raise ValueError(f"配置错误：{key} 必须是一个字典。示例见 `config/settings.yaml`。")
 
-        llm_provider = str(llm_raw.get("provider") or "ollama").strip()
-        llm_model = str(llm_raw.get("model") or "").strip()
-        llm_base_url = str(llm_raw.get("base_url") or "").strip()
-        llm_api_key = str(llm_raw.get("api_key") or "").strip()
-        llm_temperature = float(llm_raw.get("temperature") if llm_raw.get("temperature") is not None else 0.1)
+            provider = str(raw.get("provider") or "ollama").strip()
+            model = str(raw.get("model") or "").strip()
+            base_url = str(raw.get("base_url") or "").strip()
+            api_key = str(raw.get("api_key") or "").strip()
+            temperature = float(raw.get("temperature") if raw.get("temperature") is not None else 0.1)
+
+            if not model:
+                raise ValueError(f"配置缺失：{key}.model 不能为空。")
+            if not base_url and provider in {"ollama", "openai", "deepseek"}:
+                raise ValueError(f"配置缺失：{key}.base_url 不能为空（用于 Ollama/OpenAI 协议服务）。")
+
+            return LLMConfig(
+                provider=provider,
+                model=model,
+                base_url=base_url,
+                api_key=api_key,
+                temperature=temperature,
+            )
+
+        llm = _parse_llm("llm")
+        if llm is None:
+            raise ValueError("配置缺失：llm 不能为空。")
+
+        llm_reasoning = _parse_llm("llm_reasoning")
 
         if not vault_path:
             raise ValueError("配置缺失：vault_path 不能为空。")
@@ -139,23 +164,13 @@ class Config:
             raise ValueError("配置错误：debounce_timeout 必须为正整数。")
         if max_retries < 0:
             raise ValueError("配置错误：max_retries 不能为负数。")
-        if not llm_model:
-            raise ValueError("配置缺失：llm.model 不能为空。")
-        if not llm_base_url and llm_provider in {"ollama", "openai", "deepseek"}:
-            raise ValueError("配置缺失：llm.base_url 不能为空（用于 Ollama/OpenAI 协议服务）。")
-
         return ConfigData(
             vault_path=vault_path,
             db_path=db_path,
             debounce_timeout=debounce_timeout,
             max_retries=max_retries,
-            llm=LLMConfig(
-                provider=llm_provider,
-                model=llm_model,
-                base_url=llm_base_url,
-                api_key=llm_api_key,
-                temperature=llm_temperature,
-            ),
+            llm=llm,
+            llm_reasoning=llm_reasoning,
         )
 
 

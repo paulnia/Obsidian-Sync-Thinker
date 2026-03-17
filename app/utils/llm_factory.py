@@ -45,13 +45,21 @@ class LLMFactory:
             from langchain_openai import ChatOpenAI
 
             # OpenAI/DeepSeek 等：统一走 ChatOpenAI
-            # 说明：response_format 的 JSON 强制在不同版本中支持差异较大，这里同样以提示词为主。
-            return ChatOpenAI(
-                model=config.model,
-                api_key=config.api_key,
-                base_url=config.base_url,
-                temperature=config.temperature,
-            )
+            # 优先尝试使用 response_format 强制 JSON；若当前版本/网关不支持，则降级为纯提示约束。
+            common_kwargs = {
+                "model": config.model,
+                "api_key": config.api_key or None,
+                "base_url": config.base_url,
+                "temperature": config.temperature,
+            }
+            try:
+                return ChatOpenAI(
+                    **common_kwargs,
+                    response_format={"type": "json_object"},
+                )
+            except TypeError:
+                logger.info("当前 ChatOpenAI 不支持 response_format 参数，降级为提示词约束 JSON。")
+                return ChatOpenAI(**common_kwargs)
 
         if provider == "mock":
             raise NotImplementedError("provider=mock 已弃用：请在 config/settings.yaml 中配置真实 provider。")

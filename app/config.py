@@ -44,6 +44,12 @@ class ConfigData:
     # - 未配置时默认与 llm 相同
     llm_reasoning: LLMConfig | None = None
 
+    # --- Concurrency / Backpressure ---
+    # 限制同时在跑的文件处理任务数，避免批量变更导致 LLM/embedding 资源耗尽或触发限流。
+    max_concurrent_tasks: int = 2
+    # 在途任务上限：队列继续消费会导致 pending_tasks 无限增长，因此需要背压。
+    max_pending_tasks: int = 20
+
 
 class Config:
     """
@@ -123,6 +129,8 @@ class Config:
         db_path = str(loaded.get("db_path") or "")
         debounce_timeout = int(loaded.get("debounce_timeout") or 10)
         max_retries = int(loaded.get("max_retries") or 3)
+        max_concurrent_tasks = int(loaded.get("max_concurrent_tasks") or 2)
+        max_pending_tasks = int(loaded.get("max_pending_tasks") or 20)
 
         def _parse_llm(key: str) -> LLMConfig | None:
             raw = loaded.get(key)
@@ -164,6 +172,10 @@ class Config:
             raise ValueError("配置错误：debounce_timeout 必须为正整数。")
         if max_retries < 0:
             raise ValueError("配置错误：max_retries 不能为负数。")
+        if max_concurrent_tasks <= 0:
+            raise ValueError("配置错误：max_concurrent_tasks 必须大于 0。")
+        if max_pending_tasks < 0:
+            raise ValueError("配置错误：max_pending_tasks 不能为负数。")
         return ConfigData(
             vault_path=vault_path,
             db_path=db_path,
@@ -171,6 +183,8 @@ class Config:
             max_retries=max_retries,
             llm=llm,
             llm_reasoning=llm_reasoning,
+            max_concurrent_tasks=max_concurrent_tasks,
+            max_pending_tasks=max_pending_tasks,
         )
 
 

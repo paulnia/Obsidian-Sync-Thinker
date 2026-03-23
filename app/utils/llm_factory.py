@@ -41,7 +41,16 @@ class LLMFactory:
                     temperature=config.temperature,
                 )
 
-        if provider in {"openai", "deepseek"}:
+        if provider == "google":
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            # 直接返回最干净的实例，不要加额外的 kwargs，LangChain 会自己搞定 JSON 约束
+            return ChatGoogleGenerativeAI(
+                model=config.model,
+                google_api_key=config.api_key,
+                temperature=config.temperature,
+            )
+
+        elif provider in {"openai", "deepseek"}:
             from langchain_openai import ChatOpenAI
 
             # OpenAI/DeepSeek 等：统一走 ChatOpenAI

@@ -5,6 +5,7 @@ from typing import Any, Literal
 
 from langgraph.graph import END, StateGraph
 
+from app.config import get_config
 from app.core.nodes import critic_node, linker_node
 from app.core.state import KnowledgeState
 
@@ -46,13 +47,20 @@ def build_graph() -> Any:
     - 节点函数必须只返回增量更新字段（我们在 nodes.py 已遵守）
     - StateGraph 会把增量合并回 state（由 LangGraph 执行器负责）
     """
+    cfg = get_config().data
+    enable_critic = bool(getattr(cfg, "enable_critic", True))
 
     g = StateGraph(KnowledgeState)
     g.add_node("linker", linker_node)
-    g.add_node("critic", critic_node)
-
-    # 主链路：linker -> critic -> 条件边（回 linker 或 END）
     g.set_entry_point("linker")
+    if not enable_critic:
+        logger.info("Critic disabled by config (enable_critic=false)：仅执行 linker->END")
+        # 仅执行一次 linker：用于降成本/调试快速验证
+        g.add_edge("linker", END)
+        return g.compile()
+
+    g.add_node("critic", critic_node)
+    # 主链路：linker -> critic -> 条件边（回 linker 或 END）
     g.add_edge("linker", "critic")
     g.add_conditional_edges("critic", should_continue, {"linker": "linker", "__end__": END})
 

@@ -50,6 +50,9 @@ class ConfigData:
     # 在途任务上限：队列继续消费会导致 pending_tasks 无限增长，因此需要背压。
     max_pending_tasks: int = 20
 
+    # 是否启用 Critic 节点（可用于调试/降成本）
+    enable_critic: bool = False
+
 
 class Config:
     """
@@ -131,6 +134,10 @@ class Config:
         max_retries = int(loaded.get("max_retries") or 3)
         max_concurrent_tasks = int(loaded.get("max_concurrent_tasks") or 2)
         max_pending_tasks = int(loaded.get("max_pending_tasks") or 20)
+        enable_critic = loaded.get("enable_critic")
+        if enable_critic is None:
+            enable_critic = True
+        enable_critic = bool(enable_critic)
 
         def _parse_llm(key: str) -> LLMConfig | None:
             raw = loaded.get(key)
@@ -185,6 +192,7 @@ class Config:
             llm_reasoning=llm_reasoning,
             max_concurrent_tasks=max_concurrent_tasks,
             max_pending_tasks=max_pending_tasks,
+            enable_critic=enable_critic,
         )
 
 

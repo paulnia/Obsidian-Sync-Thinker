@@ -57,8 +57,8 @@
 |----------|------|------------|
 | `clean_llm_json(raw_text: str) -> str` | 从 LLM 原始文本中提取“干净 JSON”：剥离 \`\`\`json...\`\`\`，定位首尾 `[`/`{` 与 `]`/`}` 截取。 | **正则**：代码块、起止括号；**JSON 容错解析**的预处理。 |
 | `_inc_llm_call_metrics(state, delta=1) -> dict[str, int]` | 按 LangGraph 增量更新约束，累计 `metrics.llm_call_count`。 | 不原地修改 state；返回增量 metrics。 |
-| `linker_node(state: KnowledgeState) -> dict[str, Any]` | 读取 current_chunk、candidates，调用 LLM 生成 proposed_links，并转为内部格式（source/target/relation/rationale）。 | **规则路由 + 异常降级**：按 payload token 近似（短文本优先本地）与疑似敏感内容（本地优先）选择 primary（本地/远程）模型；primary 调用失败自动 fallback 到另一模型；同时使用 **LangChain** `ChatPromptTemplate`、**with_structured_output(LinkerResponse)**、**Pydantic**；最终异常时返回空 proposed_links。 |
-| `critic_node(state: KnowledgeState) -> dict[str, Any]` | 审查 proposed_links，返回 approved/feedback/valid_links；未通过且 retry_count < max_retries 时 status=retry，否则 status=approved。 | **规则路由 + 异常降级**：同样根据 payload token 近似与敏感度选择 primary（Critic 更倾向远程，阈值略低）；primary 调用失败自动 fallback；使用 **with_structured_output(CriticResponse)**；**只返回增量字段**（critique_log、proposed_links、retry_count、status）。 |
+| `linker_node(state: KnowledgeState) -> dict[str, Any]` | 读取 current_chunk、candidates，调用 LLM 生成 proposed_links，并转为内部格式（source/target/relation/rationale）。 | **规则路由 + 异常降级**：按 payload token 近似（短文本优先本地）与疑似敏感内容（本地优先）选择 primary（本地/远程）模型；primary 调用失败自动 fallback 到另一模型；并将 `state.critique_log` 最后一条 feedback 注入 linker prompt（避免 critic 打回后重复犯错）；同时仅当 primary/fallback 可能走外部 API 时触发冷却；使用 **LangChain** `ChatPromptTemplate`、**with_structured_output(LinkerResponse)**、**Pydantic**；最终异常时返回空 proposed_links。 |
+| `critic_node(state: KnowledgeState) -> dict[str, Any]` | 审查 proposed_links，返回 approved/feedback/valid_links；未通过且 retry_count < max_retries 时 status=retry，否则 status=approved。 | **规则路由 + 异常降级**：同样根据 payload token 近似与敏感度选择 primary（Critic 更倾向远程，阈值略低）；primary 调用失败自动 fallback；仅当 primary/fallback 可能走外部 API 时触发冷却；使用 **with_structured_output(CriticResponse)**；**只返回增量字段**（critique_log、proposed_links、retry_count、status）。 |
 
 ---
 
@@ -70,7 +70,7 @@
 | 函数/API | 职责 | 关键技术点 |
 |----------|------|------------|
 | `should_continue(state: KnowledgeState) -> Literal["linker", "__end__"]` | 条件边：status==retry 且 retry_count < max_retries 时回到 linker，否则到 END。 | **LangGraph** `add_conditional_edges`；尊重 retry_count/max_retries。 |
-| `build_graph() -> Any` | 构建 StateGraph(KnowledgeState)，添加 linker、critic 节点及边，编译后返回。 | **LangGraph** `StateGraph`、`set_entry_point`、`add_edge`、`add_conditional_edges`、`compile()`。 |
+| `build_graph() -> Any` | 构建 StateGraph(KnowledgeState)，添加 linker、critic 节点及边，编译后返回。 | 基于配置 `enable_critic` 动态构建：当 `enable_critic=false` 时仅执行一次 `linker`（linker -> END）；当 `enable_critic=true` 时启用 linker->critic 闭环与 conditional retry。 | 
 
 - **对外符号**：`graph`（`build_graph()` 的返回值），供 `main.py` 中 `graph.ainvoke(init_state)` 使用。
 
@@ -209,16 +209,21 @@
    - 用轻量 **query transformation** 构造 `query_text`，通过 **`vector_store.search_similar(query_text, top_k=10)`** 得到 **candidates**。
    - 在向量检索与推理之间引入 **上下文清洗层（Context Refinement Layer）**，提升候选相关性并降低上下文干扰：
      - **Hard Filtering**：剔除 self 引用、剔除短文本、按 `header` 优先去重（保留不同章节内容）。
-     - **Conditional Rerank**：当 `candidates > 4` 时触发轻量 LLM rerank，仅返回候选 ID 列表（按相关性排序），最终最多选择 Top-3；rerank 失败或无有效结果时回退到原始顺序 Top-3。
-     - （可选）当候选不足阈值时，直接使用原始顺序候选的 Top-3，避免额外 rerank 成本。
+     - **Heuristic Pre-Filter**：在 Hard Filtering 之后，按“长度 / 信息密度”启发式排序，保留 Top-5，再进入 LLM rerank。
+     - **Conditional Rerank**：当候选足够多时触发轻量 LLM rerank，仅返回候选 ID 列表（按相关性排序），最终选择 Top-2~3；rerank 失败回退到原始顺序 Top-3。
+     - **Context Compression**：在最终进入 linker 前进行纯压缩：
+       - `current_chunk.content` 截断到 <= 300 chars
+       - `candidate.content` 截断到 <= 200 chars
+     - **Call Budget Control**：每个文件最多消耗 `MAX_LLM_CALLS_PER_FILE=5` 次 LLM 调用（包含 rerank + linker/critic），超出后立即停止剩余 chunk 处理。
+     - **Dynamic Chunk Selection**：在文件级别按 chunk 内容长度排序，仅选择 Top-5 chunks 进入推理，减少无效调用与总耗时。
    - 构造 **`KnowledgeState`**：task_id、trace_id、source_file、**current_chunk**、**candidates**（已 refinement）、proposed_links=[]、critique_log=[]、retry_count=0、metrics={llm_call_count:0}、max_retries。
    - **`await graph.ainvoke(init_state)`**（`app/core/graph.py` 的 `graph`）进入 LangGraph。
 
 10. **图内数据流与闭环**：
     - **入口**：**linker** 节点。
-    - **linker_node(state)**（`app/core/nodes.py`）：先按规则路由在本地 Ollama 与远程模型之间选择 primary（短文本/疑似敏感优先本地），调用失败则 fallback 到另一模型；然后用 LLM + **with_structured_output(LinkerResponse)** 从 current_chunk + candidates 生成 **proposed_links**，写入 state（仅返回 `{"proposed_links": proposed_links}`）。
-    - **边**：linker → **critic**（固定边）。
-    - **critic_node(state)**：同样按规则路由（Critic 阈值略低，更倾向远程）并在 primary 调用失败时 fallback；使用 LLM + **with_structured_output(CriticResponse)** 审查 proposed_links，得到 approved、feedback、valid_links；若 **approved 或 retry_count >= max_retries**，则 status=**approved**，并令 proposed_links = final_links；否则 status=**retry**，retry_count+1，critique_log 追加 feedback。
+    - **linker_node(state)**（`app/core/nodes.py`）：先按规则路由在本地 Ollama 与远程模型之间选择 primary（短文本/疑似敏感优先本地），调用失败则 fallback 到另一模型；同时将 `state.critique_log` 最后一条 feedback 注入 prompt（避免 critic 打回后重复犯错）；然后用 LLM + **with_structured_output(LinkerResponse)** 从 current_chunk + candidates 生成 **proposed_links**，写入 state（仅返回 `{"proposed_links": proposed_links}` + metrics）。
+    - **边**：linker → **critic**（当配置 `enable_critic=true` 时启用；当 `enable_critic=false` 时直接 linker -> END，仅执行一次）。
+    - **critic_node(state)**：同样按规则路由（Critic 阈值略低，更倾向远程）并在 primary 调用失败时 fallback；使用 LLM + **with_structured_output(CriticResponse)** 审查 proposed_links，得到 approved、feedback、valid_links；若 **approved 或 retry_count >= max_retries**，则 status=**approved**，并令 proposed_links = final_links；否则 status=**retry**，retry_count+1，critique_log 追加 feedback（仅在启用 critic 时生效）。
     - **条件边** **`should_continue(state)`**：若 status==**retry** 且 retry_count < max_retries → 回到 **linker**；否则 → **END**。
     - 因此 **Linker 与 Critic 的闭环** 由 LangGraph 的 **conditional_edges(critic, should_continue, {"linker": "linker", "__end__": END})** 实现：打回则重跑 linker，通过或达重试上限则结束。
 
@@ -325,6 +330,23 @@ for each chunk:
 
 5. **正确的任务完成语义**
    - 每个文件任务结束（成功/失败/异常）时都会调用 `queue.task_done()`，确保队列语义正确
+
+### 4.7 Context Refinement Layer（压缩 + 预算）工程细节
+
+为降低 Token、提高信息密度并控制系统复杂度，系统在向量检索与 linker/critic 推理之间引入工程级 refinement：
+
+1. **动态 chunk 选择（Dynamic Chunk Selection）**
+   - 文件内 chunk 按 `len(chunk.content)` 降序排序
+   - 仅保留 Top-5 chunk 进入推理，避免无效调用
+
+2. **调用熔断（Call Budget Control）**
+   - 每文件维护 `MAX_LLM_CALLS_PER_FILE=5` 的调用预算
+   - 预算耗尽后停止剩余 chunk 的复杂处理（避免高并发场景下的连锁限流）
+
+3. **上下文压缩层（Context Compression）**
+   - `current_chunk.content` 截断到 300 chars
+   - `candidate.content` 截断到 200 chars
+   - 在保持结构化字段完整的前提下，显著降低输入规模与延迟
 
 ---
 

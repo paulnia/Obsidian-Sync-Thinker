@@ -8,6 +8,7 @@ import logging
 import argparse
 import asyncio
 import contextlib
+import re
 import signal
 import time
 import uuid
@@ -127,6 +128,46 @@ def _hard_filter_candidates(
     return distinct
 
 
+def _info_density_score(text: str) -> float:
+    """
+    信息密度启发式评分（近似指标）：
+    - 去掉空白后，取“独特字符数 / 总字符数”的比例，再乘以总长度权重
+    - 目标：偏向“内容更丰富且不太重复”的片段
+    """
+
+    t = re.sub(r"\s+", "", str(text or ""))
+    if not t:
+        return 0.0
+    uniq = len(set(t))
+    total = max(1, len(t))
+    # 加一个长度权重，避免纯短文本在密度上占优
+    return (uniq / total) * total
+
+
+def _heuristic_prefilter_candidates(
+    candidates: list[dict[str, object]],
+    *,
+    top_n: int = 5,
+) -> list[dict[str, object]]:
+    """
+    Heuristic Pre-Filter：
+    - 按长度 / 信息密度排序
+    - 保留 Top-N
+    """
+
+    def _content(it: dict[str, object]) -> str:
+        return str(it.get("content") or "")
+
+    def _score(it: dict[str, object]) -> tuple[int, float]:
+        c = _content(it).strip()
+        length = len(c)
+        density = _info_density_score(c)
+        return (length, density)
+
+    sorted_items = sorted(candidates, key=_score, reverse=True)
+    return sorted_items[: max(1, int(top_n))]
+
+
 async def _conditional_rerank(
     *,
     llm: object,
@@ -134,7 +175,7 @@ async def _conditional_rerank(
     candidates: list[dict[str, object]],
     trace_id: str,
     max_pick: int = 3,
-) -> list[dict[str, object]]:
+) -> tuple[list[dict[str, object]], int]:
     """
     Conditional Rerank（关键）：
     - 当候选数量 > 4：调用轻量 LLM rerank（只返回候选 ID）
@@ -143,7 +184,8 @@ async def _conditional_rerank(
     """
 
     if len(candidates) <= 4:
-        return candidates[:max_pick]
+        # 未触发 rerank：不增加 LLM 调用次数
+        return candidates[:max_pick], 0
 
     logger.info("Rerank triggered trace_id=%s candidates=%d", trace_id, len(candidates))
 
@@ -188,7 +230,8 @@ async def _conditional_rerank(
         ranked_ids = list(getattr(resp, "ranked_ids", []) or [])
     except Exception as e:
         logger.warning("Rerank 失败，回退到原始 candidates。trace_id=%s error=%s", trace_id, e)
-        return candidates[:max_pick]
+        # 发生 rerank 调用失败：本次计入一次 LLM 调用预算消耗
+        return candidates[:max_pick], 1
 
     logger.info("Rerank result trace_id=%s ranked_ids=%s", trace_id, ranked_ids)
 
@@ -206,13 +249,13 @@ async def _conditional_rerank(
             break
 
     if not picked:
-        return candidates[:max_pick]
+        return candidates[:max_pick], 1
 
     if len(picked) < max_pick:
         remaining = [c for c in candidates if c not in picked]
         picked.extend(remaining[: max_pick - len(picked)])
 
-    return picked
+    return picked, 1
 
 
 async def worker_loop(queue: asyncio.Queue[str]) -> None:
@@ -261,6 +304,17 @@ async def worker_loop(queue: asyncio.Queue[str]) -> None:
             try:
                 logger.info("开始处理任务: %s trace_id=%s", filepath, trace_id)
 
+                # Context Refinement Layer & Dynamic Control（文件级策略）
+                # 1) 动态 chunk：避免无效调用，只处理信息量更大的 Top-N chunks
+                DYNAMIC_CHUNK_TOP_N = 5
+                # 2) 调用熔断：限制每个文件最多的 LLM 调用次数（包含 rerank + linker/critic）
+                MAX_LLM_CALLS_PER_FILE = 5
+                # 3) 上下文压缩：current_chunk / candidate 内容截断
+                CURRENT_CHUNK_MAX_CHARS = 300
+                CANDIDATE_MAX_CHARS = 200
+                # 4) 候选启发式筛选：Hard Filter 后保留 Top-5，再进入 LLM rerank
+                HEURISTIC_CANDIDATE_TOP_N = 5
+
                 # 1) 计算 MD5 并做幂等检查（未变化则跳过）
                 try:
                     # 关键修复：使用“核心内容 MD5”（已剔除 AI 回写区块），避免自我触发死循环
@@ -292,10 +346,36 @@ async def worker_loop(queue: asyncio.Queue[str]) -> None:
                 vector_store.add_chunks(chunks)
                 embed_seconds = time.perf_counter() - embed_started_at
 
-                # 4) 对每个 chunk 检索 candidates（排除当前文件，优先同目录），跑 LangGraph 状态机，收集 links
+                # 4) 动态 chunk 选择（Dynamic Chunk Selection）
+                #    只处理内容长度更长的 Top-N，避免大量无意义 chunk 触发 LLM 调用。
+                chunks_sorted = sorted(
+                    chunks,
+                    key=lambda c: len(str(c.get("content") or "")),
+                    reverse=True,
+                )
+                chunks_for_infer = chunks_sorted[: max(1, int(DYNAMIC_CHUNK_TOP_N))]
+                logger.info(
+                    "Dynamic Chunk Selection trace_id=%s file=%s original_chunks=%d selected_chunks=%d",
+                    trace_id,
+                    filepath,
+                    len(chunks),
+                    len(chunks_for_infer),
+                )
+
+                # 5) 对每个 chunk 检索 candidates（排除当前文件，优先同目录），跑 LangGraph 状态机，收集 links
                 final_links: list[dict] = []
 
-                for idx, chunk in enumerate(chunks):
+                for idx, chunk in enumerate(chunks_for_infer):
+                    if total_llm_calls > MAX_LLM_CALLS_PER_FILE:
+                        logger.warning(
+                            "Call budget exceeded trace_id=%s file=%s llm_calls=%d > max=%d, stop remaining chunks.",
+                            trace_id,
+                            filepath,
+                            total_llm_calls,
+                            MAX_LLM_CALLS_PER_FILE,
+                        )
+                        break
+
                     # 轻量 query transformation：提升检索质量（不改变后续 linker/critic 逻辑契约）
                     query_text = _transform_query_for_retrieval(chunk)
                     candidates = (
@@ -316,11 +396,18 @@ async def worker_loop(queue: asyncio.Queue[str]) -> None:
                         exclude_file_norm=cur_file_norm,
                     )
 
-                    # 2) Conditional Rerank：候选足够多时引入 LLM rerank（只返回 ID）
-                    #    失败则回退到原始顺序 Top-3
+                    # 2) Heuristic Pre-Filter：
+                    #    按长度 / 信息密度启发式排序，保留 Top-5，再交给 LLM rerank
+                    candidates = _heuristic_prefilter_candidates(
+                        candidates,
+                        top_n=HEURISTIC_CANDIDATE_TOP_N,
+                    )
+
+                    # 3) LLM Rerank（轻量模型）：
+                    #    输入 Top-5，输出 Top-2~3（ID列表），失败回退到原始 Top-3
                     rerank_cfg = cfg.llm_reasoning or cfg.llm
                     rerank_llm = LLMFactory.get_llm(rerank_cfg)
-                    candidates = await _conditional_rerank(
+                    candidates, rerank_calls = await _conditional_rerank(
                         llm=rerank_llm,
                         current_text=query_text,
                         candidates=candidates,
@@ -328,13 +415,57 @@ async def worker_loop(queue: asyncio.Queue[str]) -> None:
                         max_pick=3,
                     )
 
+                    total_llm_calls += int(rerank_calls or 0)
+                    logger.info(
+                        "Context Refinement trace_id=%s file=%s chunk_idx=%d candidates_after_rerank=%d llm_calls=%d",
+                        trace_id,
+                        filepath,
+                        idx,
+                        len(candidates),
+                        total_llm_calls,
+                    )
+
+                    if total_llm_calls > MAX_LLM_CALLS_PER_FILE:
+                        logger.warning(
+                            "Call budget reached after rerank trace_id=%s file=%s llm_calls=%d > max=%d, break.",
+                            trace_id,
+                            filepath,
+                            total_llm_calls,
+                            MAX_LLM_CALLS_PER_FILE,
+                        )
+                        break
+
+                    # 4) Context Truncation（纯压缩）：
+                    #    current_chunk <= 300 chars, candidate <= 200 chars
+                    current_chunk_trunc = dict(chunk)
+                    raw_current_content = str(chunk.get("content") or "")
+                    current_chunk_trunc["content"] = raw_current_content[:CURRENT_CHUNK_MAX_CHARS]
+
+                    candidates_trunc: list[dict[str, object]] = []
+                    for c in candidates:
+                        cc = dict(c)
+                        cc["content"] = str(c.get("content") or "")[:CANDIDATE_MAX_CHARS]
+                        candidates_trunc.append(cc)
+
+                    trunc_current_len = len(str(current_chunk_trunc.get("content") or ""))
+                    trunc_candidate_lens = [len(str(cc.get("content") or "")) for cc in candidates_trunc]
+                    logger.info(
+                        "Context Compression trace_id=%s file=%s chunk_idx=%d current_len=%d->%d candidate_lens=%s",
+                        trace_id,
+                        filepath,
+                        idx,
+                        len(raw_current_content),
+                        trunc_current_len,
+                        trunc_candidate_lens,
+                    )
+
                     # KnowledgeState 初始化（只放必要字段）
                     init_state: KnowledgeState = {
                         "task_id": f"{current_md5}:{idx}",
                         "trace_id": trace_id,
                         "source_file": filepath,
-                        "current_chunk": chunk,
-                        "candidates": candidates,
+                        "current_chunk": current_chunk_trunc,
+                        "candidates": candidates_trunc,
                         "proposed_links": [],
                         "critique_log": [],
                         "retry_count": 0,
@@ -362,6 +493,17 @@ async def worker_loop(queue: asyncio.Queue[str]) -> None:
                     metrics = out_state.get("metrics") if isinstance(out_state, dict) else None
                     if isinstance(metrics, dict):
                         total_llm_calls += int(metrics.get("llm_call_count") or 0)
+
+                    # 调用熔断：超出 LLM 预算后，跳过后续 chunk 的复杂推理
+                    if total_llm_calls > MAX_LLM_CALLS_PER_FILE:
+                        logger.warning(
+                            "Call budget reached after linker trace_id=%s file=%s llm_calls=%d > max=%d, stop remaining chunks.",
+                            trace_id,
+                            filepath,
+                            total_llm_calls,
+                            MAX_LLM_CALLS_PER_FILE,
+                        )
+                        break
 
                 # 5) 回写 AI-Insights 区块（非侵入式 upsert）
                 wr = await writer.write_links_async(filepath, final_links)

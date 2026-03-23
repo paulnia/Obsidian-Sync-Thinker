@@ -266,16 +266,25 @@ async def linker_node(state: KnowledgeState) -> dict[str, Any]:
     - 不要原地修改 state 内的列表/字典
     - 只返回需要更新的字段（不要返回整个 state）
     """
-    # 强制冷却 5-10 秒，避开免费接口的频率惩罚
-    logger.info(" Linker 节点准备就绪，冷却 15 秒以防触发限流...")
-    await asyncio.sleep(15)
-    logger.info("进入 Linker Node")
-
     cfg = get_config().data
     trace_id = str(state.get("trace_id") or "n/a")
+    logger.info("进入 Linker Node trace_id=%s", trace_id)
 
     current_chunk = state.get("current_chunk") or {}
     candidates = state.get("candidates") or []
+
+    # 关键修复：当 critic 打回（retry）时，将“最后一次反馈”显式注入 linker，
+    # 避免 linker 重复犯同样的错误模式。
+    last_feedback = ""
+    critique_log = list(state.get("critique_log") or [])
+    if critique_log:
+        last_feedback = str(critique_log[-1] or "")
+        if last_feedback:
+            logger.info(
+                "Linker 注入上一轮 feedback trace_id=%s feedback_preview=%r",
+                trace_id,
+                last_feedback[:80],
+            )
 
     # 规则路由：在 local/remote 之间选择“primary + fallback”
     local_llm_cfg = cfg.llm
@@ -301,6 +310,15 @@ async def linker_node(state: KnowledgeState) -> dict[str, Any]:
 
     llm_primary = LLMFactory.get_llm(primary_cfg)
     llm_fallback = llm_primary if fallback_cfg == primary_cfg else LLMFactory.get_llm(fallback_cfg)
+
+    # 只对外部 API 模型进行“强制冷却”（如果 primary 或 fallback 可能走外部，就先冷却）
+    primary_is_local = str(primary_cfg.provider or "").strip().lower() == "ollama"
+    cooldown_seconds = 0 if (primary_is_local) else 15
+    if cooldown_seconds > 0:
+        logger.info("Linker 冷却 %ss（外部 API），trace_id=%s", cooldown_seconds, trace_id)
+        await asyncio.sleep(cooldown_seconds)
+    else:
+        logger.info("Linker 无需冷却（本地模型），trace_id=%s", trace_id)
 
     prompt = ChatPromptTemplate.from_messages(
         [
@@ -328,7 +346,8 @@ async def linker_node(state: KnowledgeState) -> dict[str, Any]:
             ),
             (
                 "human",
-                "当前片段(current_chunk):\n{current_chunk}\n\n候选片段列表(candidates):\n{candidates}\n",
+                "当前片段:\n{current_chunk}\n\n候选片段:\n{candidates}\n\n"
+                "上一次审查未通过原因（必须避免重复犯错）:\n{feedback}\n",
             ),
         ]
     )
@@ -342,6 +361,7 @@ async def linker_node(state: KnowledgeState) -> dict[str, Any]:
             payload={
                 "current_chunk": current_chunk_text,
                 "candidates": candidates_text,
+                "feedback": last_feedback,
             },
             who="Linker",
             primary_desc=f"{primary_cfg.provider}:{primary_cfg.model}",
@@ -393,13 +413,9 @@ async def critic_node(state: KnowledgeState) -> dict[str, Any]:
     - 不要原地修改 critique_log
     - 只返回需要更新的字段（不要返回整个 state）
     """
-    # 强制冷却 5-10 秒，避开免费接口的频率惩罚
-    logger.info(" Critic 节点准备就绪，冷却 20 秒以防触发限流...")
-    await asyncio.sleep(20)
-    logger.info("进入 Critic Node, 当前 retry_count: %s", state.get("retry_count", 0))
-
     cfg = get_config().data
     trace_id = str(state.get("trace_id") or "n/a")
+    logger.info("进入 Critic Node trace_id=%s, 当前 retry_count: %s", trace_id, state.get("retry_count", 0))
 
     retry_count = int(state.get("retry_count") or 0)
     max_retries = int(state.get("max_retries") or cfg.max_retries or 2)
@@ -432,6 +448,15 @@ async def critic_node(state: KnowledgeState) -> dict[str, Any]:
 
     llm_primary = LLMFactory.get_llm(primary_cfg)
     llm_fallback = llm_primary if fallback_cfg == primary_cfg else LLMFactory.get_llm(fallback_cfg)
+
+    # 只对外部 API 模型进行“强制冷却”（如果 primary 或 fallback 可能走外部，就先冷却）
+    primary_is_local = str(primary_cfg.provider or "").strip().lower() == "ollama"
+    cooldown_seconds = 0 if (primary_is_local) else 20
+    if cooldown_seconds > 0:
+        logger.info("Critic 冷却 %ss（外部 API），trace_id=%s", cooldown_seconds, trace_id)
+        await asyncio.sleep(cooldown_seconds)
+    else:
+        logger.info("Critic 无需冷却（本地模型），trace_id=%s", trace_id)
 
     prompt = ChatPromptTemplate.from_messages(
         [
